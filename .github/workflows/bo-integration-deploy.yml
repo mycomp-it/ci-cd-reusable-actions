@@ -1,0 +1,129 @@
+name: bo-integration-deploy (reusable)
+
+# Merge del branch PR nel branch integration, build della back-office legacy
+# dal branch integration, deploy in una cartella S3 fissa (sovrascritta).
+# Il caller deve dichiarare: permissions: { contents: write, id-token: write }
+# e passare secrets: inherit.
+#
+# Richiesti sul repo chiamante:
+#   secrets: AWS_ROLE, AWS_DISTRIBUTION_ID
+#   vars:    AWS_BUCKET_NAME, AWS_REGION, BO_HOSTNAME_V2
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: App folder to build/deploy
+        required: false
+        default: pms-manager-angularjs
+        type: string
+      integration_branch:
+        description: Long-lived integration branch
+        required: false
+        default: integration
+        type: string
+      s3_folder:
+        description: Fixed S3 folder (overwritten each run)
+        required: false
+        default: integration
+        type: string
+      node_version:
+        description: Node.js version
+        required: false
+        default: "22.x"
+        type: string
+
+jobs:
+  integrate-and-deploy:
+    name: Merge → build → deploy integration
+    runs-on: self-hosted
+    environment: staging
+    env:
+      APP: ${{ inputs.app }}
+      SERVICE_NAME: ${{ inputs.app }}
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Merge PR branch into integration & push
+        uses: mycomp-it/ci-cd-reusable-actions/actions/merge-into-integration@main
+        with:
+          head_ref: ${{ github.head_ref }}
+          integration_branch: ${{ inputs.integration_branch }}
+
+      - name: Ensure integration content is checked out
+        env:
+          INTEGRATION_BRANCH: ${{ inputs.integration_branch }}
+        run: git checkout "${INTEGRATION_BRANCH}"
+
+      - name: Create Build Variables
+        id: vars
+        uses: mycomp-it/ci-cd-reusable-actions/actions/create-build-variables@main
+        with:
+          service_name: ${{ env.SERVICE_NAME }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund --silent
+
+      - name: Build (prod bundles)
+        run: npm run build:prod
+
+      - name: Clean folder
+        run: |
+          rm -fr .git* || true
+          rm -f README* || true
+          rm -f compose* || true
+          rm -fr dev-tools || true
+
+      - name: Create .build_info
+        run: |
+          cat <<EOF > .build_info
+          buildDate=${{ steps.vars.outputs.BUILD_DATE }}
+          commit=${{ steps.vars.outputs.FULL_SHA }}
+          commitDate=${{ steps.vars.outputs.COMMIT_DATE }}
+          tag=${{ steps.vars.outputs.REF_NAME }}
+          branch=${{ inputs.integration_branch }}
+          EOF
+          cp .build_info "${APP}/"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: GitHub-OIDC-integration
+
+      - name: Deploy to S3 (overwrite integration folder)
+        run: |
+          dest="s3://${{ vars.AWS_BUCKET_NAME }}/${{ inputs.s3_folder }}"
+          for attempt in 1 2 3; do
+            echo "S3 sync attempt $attempt -> $dest"
+            aws s3 sync "${APP}" "$dest" --delete && exit 0
+            [ "$attempt" -lt 3 ] && { echo "S3 sync failed, retrying..."; sleep 10; }
+          done
+          echo "::error::S3 sync failed after 3 attempts"; exit 1
+
+      - name: Invalidate CloudFront
+        uses: chetan/invalidate-cloudfront-action@v2
+        env:
+          DISTRIBUTION: ${{ secrets.AWS_DISTRIBUTION_ID }}
+          PATHS: "/*"
+          AWS_REGION: ${{ vars.AWS_REGION }}
+
+      - name: Verify deployment
+        run: |
+          URL="${{ vars.BO_HOSTNAME_V2 }}/${{ inputs.s3_folder }}/"
+          echo "Checking $URL"
+          if wget --quiet --tries=3 --spider "$URL"; then
+            echo "HTTP 200 OK"
+          else
+            echo "::warning::Verify non riuscito su $URL (non blocca il deploy)"
+          fi

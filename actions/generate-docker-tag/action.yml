@@ -1,0 +1,53 @@
+# .github/actions/generate-docker-tag/action.yml
+
+name: 'Generate Docker Tag'
+description: 'Generates a Docker tag based on the branch name (Jira ticket or first 8 chars).'
+
+# Definiamo gli output che questa azione produrrà
+outputs:
+  tag:
+    description: "The generated and sanitized tag (e.g., MGC-1234 or my-branc)."
+    value: ${{ steps.generate.outputs.tag }}
+  short_sha:
+    description: "The 8-character short commit SHA."
+    value: ${{ steps.generate.outputs.short_sha }}
+  image_full_name:
+    description: "The full Docker image name for the E2E tests, including the registry and tag."
+    value: ${{ steps.generate.outputs.image_full_name }}
+
+# Definiamo gli input che questa azione accetta
+inputs:
+  e2e_tests_repo:
+    description: 'The name of the E2E tests repository (e.g., pms-privacy-e2e).'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - id: generate
+      shell: bash
+      run: |
+        COMMIT_SHA=$(echo "${{ github.sha }}" | cut -c 1-8)
+        echo "Commit SHA: ${COMMIT_SHA}"
+
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          BRANCH_NAME="${{ github.head_ref }}"
+        else
+          BRANCH_NAME="${{ github.ref_name }}"
+        fi
+        echo "Original branch name: ${BRANCH_NAME}"
+
+        TAG=""
+        JIRA_TICKET=$(echo "${BRANCH_NAME}" | grep -o -i "^MGC-[0-9]\+" || true)
+        if [[ -n "$JIRA_TICKET" ]]; then
+          TAG=$(echo "$JIRA_TICKET" | tr '[:lower:]' '[:upper:]')
+        else
+          TAG=$(echo "${BRANCH_NAME}" | cut -c 1-8)
+        fi
+
+        SANITIZED_TAG=$(echo "${TAG}" | sed -e 's/[^a-zA-Z0-9.-]/-/g')
+
+        echo "Generated tag: ${SANITIZED_TAG}"
+        echo "tag=${SANITIZED_TAG}" >> $GITHUB_OUTPUT
+        echo "short_sha=${COMMIT_SHA}" >> $GITHUB_OUTPUT
+        echo "image_full_name=ghcr.io/${{ github.repository_owner }}/${{ inputs.e2e_tests_repo }}:${SANITIZED_TAG}" >> $GITHUB_OUTPUT
