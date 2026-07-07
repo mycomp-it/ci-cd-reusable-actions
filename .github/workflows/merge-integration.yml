@@ -1,0 +1,107 @@
+name: merge-integration (reusable)
+
+# Reusable: merge a source branch into a long-lived integration branch.
+# Fails the job on merge conflict or any git error. Designed to be reusable by
+# other repos too — parameterise the source ref, integration branch, runner, and
+# git identity; pass a push-capable token via secrets.token.
+#
+# Cross-repo usage:
+#   jobs:
+#     merge:
+#       permissions:
+#         contents: write
+#       uses: mycomp-it/ci-cd-reusable-actions/.github/workflows/merge-integration.yml@main
+#       with:
+#         source_ref: ${{ github.event.pull_request.head.ref }}
+#       secrets:
+#         token: ${{ secrets.GITHUB_TOKEN }}
+#
+# NOTE: pushes made with the default GITHUB_TOKEN do NOT trigger further
+# workflow runs. If you later add CI that must run on the integration branch,
+# pass a PAT / GitHub App token as secrets.token instead.
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Branch/ref to merge INTO the integration branch (e.g. PR head ref).
+        required: true
+        type: string
+      integration_branch:
+        description: Long-lived integration branch to merge into.
+        required: false
+        default: integration
+        type: string
+      runner:
+        description: Runner label for the merge job (e.g. ubuntu-latest or self-hosted).
+        required: false
+        default: ubuntu-latest
+        type: string
+      git_user_name:
+        description: git user.name for the merge commit.
+        required: false
+        default: github-actions[bot]
+        type: string
+      git_user_email:
+        description: git user.email for the merge commit.
+        required: false
+        default: 41898282+github-actions[bot]@users.noreply.github.com
+        type: string
+    secrets:
+      token:
+        description: Token with push (contents:write) permission on the repo.
+        required: true
+
+jobs:
+  merge:
+    name: Merge into ${{ inputs.integration_branch }}
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.token }}
+          persist-credentials: true
+
+      - name: Configure git identity
+        env:
+          GIT_USER_NAME: ${{ inputs.git_user_name }}
+          GIT_USER_EMAIL: ${{ inputs.git_user_email }}
+        run: |
+          git config user.name  "$GIT_USER_NAME"
+          git config user.email "$GIT_USER_EMAIL"
+
+      - name: Merge source into integration
+        # Untrusted values (branch names) are passed via env and only ever used
+        # as quoted git arguments — never interpolated into the shell.
+        env:
+          INTEGRATION_BRANCH: ${{ inputs.integration_branch }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          git fetch origin
+
+          # Integration branch must already exist on origin.
+          if ! git show-ref --verify --quiet "refs/remotes/origin/${INTEGRATION_BRANCH}"; then
+            echo "::error::Integration branch '${INTEGRATION_BRANCH}' does not exist on origin. Create it once before using this workflow."
+            exit 1
+          fi
+          git switch -C "$INTEGRATION_BRANCH" "origin/${INTEGRATION_BRANCH}"
+
+          # Source ref must exist on origin (PR head branch).
+          if ! git show-ref --verify --quiet "refs/remotes/origin/${SOURCE_REF}"; then
+            echo "::error::Source ref 'origin/${SOURCE_REF}' not found."
+            exit 1
+          fi
+
+          echo "Merging origin/${SOURCE_REF} into ${INTEGRATION_BRANCH}"
+          if ! git merge --no-ff --no-edit "origin/${SOURCE_REF}"; then
+            echo "::error::Merge conflict (or merge error) merging origin/${SOURCE_REF} into ${INTEGRATION_BRANCH}. Aborting."
+            git merge --abort || true
+            exit 1
+          fi
+
+          git push origin "HEAD:${INTEGRATION_BRANCH}"
+          echo "Merged and pushed ${SOURCE_REF} -> ${INTEGRATION_BRANCH}."

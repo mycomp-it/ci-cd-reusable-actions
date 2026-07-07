@@ -1,8 +1,10 @@
 name: _build-deploy (reusable)
 
 # Reusable build + deploy for any Vue app in this monorepo.
-# Builds <app>/dist and syncs it to s3://$STYLES_BUCKET/backoffice/v2.1/<app>/
+# Builds <app>/dist and syncs it to s3://$STYLES_BUCKET/backoffice/v3/<app>/
 # (same destination mysaas-fe serves), then invalidates CloudFront.
+# When `preview_id` is set, deploys instead to an isolated per-PR path
+# s3://$STYLES_BUCKET/backoffice/v3/pr/<preview_id>/<app>/.
 #
 # Required per-environment config on the calling repo:
 #   secrets:  AWS_ROLE             (OIDC role ARN to assume)
@@ -23,6 +25,13 @@ on:
         required: false
         default: my-crs
         type: string
+      preview_id:
+        description: >-
+          When set (e.g. a PR number), deploy to an isolated preview path
+          backoffice/v3/pr/<preview_id>/<app>/ instead of backoffice/v3/<app>/.
+        required: false
+        default: ''
+        type: string
 
 jobs:
   build-deploy:
@@ -34,8 +43,19 @@ jobs:
       contents: read
     env:
       APP: ${{ inputs.app }}
-      S3_PREFIX: backoffice/v3/${{ inputs.app }}
     steps:
+      - name: Resolve S3 prefix
+        run: |
+          if [ -n "${PREVIEW_ID}" ]; then
+            PREFIX="backoffice/v3/pr/${PREVIEW_ID}/${APP}"
+          else
+            PREFIX="backoffice/v3/${APP}"
+          fi
+          echo "S3_PREFIX=${PREFIX}" >> "$GITHUB_ENV"
+          echo "Resolved S3_PREFIX=${PREFIX}"
+        env:
+          PREVIEW_ID: ${{ inputs.preview_id }}
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -70,11 +90,18 @@ jobs:
       - name: Sync to S3 styles bucket
         run: |
           echo "Syncing ${APP}/dist -> s3://${STYLES_BUCKET}/${S3_PREFIX}/"
+          # Preview deploys reconcile (--delete) so stale hashed chunks/assets
+          # don't pile up across re-pushes. Shared v3/<app>/ deploys never delete.
+          DELETE_FLAG=""
+          if [ -n "${PREVIEW_ID}" ]; then
+            DELETE_FLAG="--delete"
+          fi
           aws s3 sync "${APP}/dist" "s3://${STYLES_BUCKET}/${S3_PREFIX}/" \
-            --acl public-read
+            --acl public-read $DELETE_FLAG
           echo "Sync complete."
         env:
           STYLES_BUCKET: ${{ vars.STYLES_BUCKET }}
+          PREVIEW_ID: ${{ inputs.preview_id }}
 
       - name: Invalidate CloudFront
         run: |
