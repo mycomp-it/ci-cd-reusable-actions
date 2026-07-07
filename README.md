@@ -5,11 +5,10 @@ CI riusabile condivisa dell'org `mycomp-it`. Referenziare via `@main`.
 ## Composite actions (`actions/`)
 - `generate-docker-tag` — tag docker dal nome branch (ticket Jira o primi 8 char).
 - `create-build-variables` — variabili di build (artifact name, timestamp, SHA, ref).
-- `merge-into-integration` — mergia un branch nel branch `integration` e lo pusha; fallisce sui conflitti.
 
 ## Reusable workflows (`.github/workflows/`)
-- `vue-build-deploy.yml` — build+deploy di una Vue app sullo styles bucket.
-- `bo-integration-deploy.yml` — merge→build→deploy dell'ambiente di integrazione bo-pms-webapp (legacy).
+- `merge-integration.yml` — mergia un branch nel branch `integration` e lo pusha; fallisce sui conflitti. Input `runner` (default `ubuntu-latest`), `secrets.token` per il push. Cross-repo.
+- `vue-build-deploy.yml` — build+deploy di una Vue app sullo styles bucket; input `preview_id` per deploy per-PR isolati.
 
 ## Consumer attuali
 - `bo-pms-webapp`, `vue-applications`.
