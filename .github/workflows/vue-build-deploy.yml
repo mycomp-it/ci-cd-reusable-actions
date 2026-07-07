@@ -1,0 +1,105 @@
+name: _build-deploy (reusable)
+
+# Reusable build + deploy for any Vue app in this monorepo.
+# Builds <app>/dist and syncs it to s3://$STYLES_BUCKET/backoffice/v2.1/<app>/
+# (same destination mysaas-fe serves), then invalidates CloudFront.
+#
+# Required per-environment config on the calling repo:
+#   secrets:  AWS_ROLE             (OIDC role ARN to assume)
+#   vars:     STYLES_BUCKET        (S3 bucket, e.g. mgc-styles)
+#             AWS_REGION           (e.g. eu-central-1)
+#             AWS_DISTRIBUTION_ID  (CloudFront distribution id)
+#             BUCKET_HOSTNAME      (public host for the verify step)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub Environment (staging | production)
+        required: true
+        type: string
+      app:
+        description: App folder to build/deploy
+        required: false
+        default: my-crs
+        type: string
+
+jobs:
+  build-deploy:
+    name: Build & deploy ${{ inputs.app }} → ${{ inputs.environment }}
+    runs-on: self-hosted
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      APP: ${{ inputs.app }}
+      S3_PREFIX: backoffice/v3/${{ inputs.app }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+
+      - name: Install dependencies
+        working-directory: ${{ env.APP }}
+        run: npm ci
+
+      - name: Lint
+        working-directory: ${{ env.APP }}
+        run: npm run lint
+
+      - name: Unit tests
+        working-directory: ${{ env.APP }}
+        run: npx vitest --run
+
+      - name: Build
+        working-directory: ${{ env.APP }}
+        run: npm run build:ci
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: GitHub-OIDC-${{ inputs.app }}-${{ inputs.environment }}
+
+      - name: Sync to S3 styles bucket
+        run: |
+          echo "Syncing ${APP}/dist -> s3://${STYLES_BUCKET}/${S3_PREFIX}/"
+          aws s3 sync "${APP}/dist" "s3://${STYLES_BUCKET}/${S3_PREFIX}/" \
+            --acl public-read
+          echo "Sync complete."
+        env:
+          STYLES_BUCKET: ${{ vars.STYLES_BUCKET }}
+
+      - name: Invalidate CloudFront
+        run: |
+          echo "Invalidating /${S3_PREFIX}/* on distribution ${DISTRIBUTION_ID}"
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id "${DISTRIBUTION_ID}" \
+            --paths "/${S3_PREFIX}/*" \
+            --query 'Invalidation.Id' --output text)
+          echo "Created invalidation: ${INVALIDATION_ID}"
+          aws cloudfront wait invalidation-completed \
+            --distribution-id "${DISTRIBUTION_ID}" \
+            --id "${INVALIDATION_ID}"
+          echo "Invalidation completed."
+        env:
+          DISTRIBUTION_ID: ${{ vars.AWS_DISTRIBUTION_ID }}
+
+      - name: Verify deployment
+        run: |
+          URL="${BUCKET_HOSTNAME%/}/${S3_PREFIX}/profile.js"
+          echo "Checking ${URL}"
+          if wget --quiet --tries=3 --spider "${URL}"; then
+            echo "HTTP 200 OK"
+          else
+            echo "Verify failed for ${URL}"
+            exit 1
+          fi
+        env:
+          BUCKET_HOSTNAME: ${{ vars.BUCKET_HOSTNAME }}

@@ -1,0 +1,74 @@
+# .github/actions/create-build-variables/action.yml
+
+name: 'Create Build Variables'
+description: 'Generates a set of build variables like artifact name, timestamps, and SHAs.'
+
+# Definiamo gli input che questa azione accetta
+inputs:
+  service_name:
+    description: "The name of the service being built (e.g., pms-privacy-fo)."
+    required: true
+
+# Definiamo tutti gli output che verranno prodotti
+outputs:
+  artifact_name:
+    description: "The generated name for the build artifact."
+    value: ${{ steps.vars.outputs.artifact_name }}
+  BUILD_DATE:
+    description: "The build date in UTC."
+    value: ${{ steps.vars.outputs.BUILD_DATE }}
+  FULL_SHA:
+    description: "The full commit SHA."
+    value: ${{ steps.vars.outputs.FULL_SHA }}
+  COMMIT_DATE:
+    description: "The commit date in UTC."
+    value: ${{ steps.vars.outputs.COMMIT_DATE }}
+  REF_NAME:
+    description: "The branch or tag name."
+    value: ${{ steps.vars.outputs.REF_NAME }}
+  BRANCH_NAME:
+    description: "The source branch name for a PR."
+    value: ${{ steps.vars.outputs.BRANCH_NAME }}
+  TIMESTAMP:
+    description: "A formatted timestamp for the artifact."
+    value: ${{ steps.vars.outputs.TIMESTAMP }}
+  SHORT_SHA:
+    description: "The short commit SHA."
+    value: ${{ steps.vars.outputs.SHORT_SHA }}
+  SERVICE_NAME:
+    description: "The service name."
+    value: ${{ steps.vars.outputs.SERVICE_NAME }}
+
+runs:
+  using: "composite"
+  steps:
+    - id: vars
+      shell: bash
+      run: |
+        SERVICE_NAME="${{ inputs.service_name }}"
+        RAW_COMMIT_DATE=$(git log -1 --format=%cI)
+        COMMIT_DATE_NOZONE=${RAW_COMMIT_DATE%+*}
+        COMMIT_DATE="$COMMIT_DATE_NOZONE"
+        BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%S')
+        DATE_PART=${COMMIT_DATE_NOZONE%%T*}
+        TIME_PART=${COMMIT_DATE_NOZONE#*T}
+        HOUR_MIN=${TIME_PART:0:2}${TIME_PART:3:2}
+        TIMESTAMP="${DATE_PART}T${HOUR_MIN}"
+        FULL_SHA=$(git rev-parse HEAD)
+        SHORT_SHA=${FULL_SHA:0:8}
+        ARTIFACT_NAME="${SERVICE_NAME}_${TIMESTAMP}_${SHORT_SHA}"
+        if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+          REF_NAME="${GITHUB_REF##refs/tags/}"
+        else
+          REF_NAME="${GITHUB_REF##refs/heads/}"
+        fi
+        BRANCH_NAME="${{ github.head_ref }}"
+        echo "artifact_name=${ARTIFACT_NAME}" >> $GITHUB_OUTPUT
+        echo "BUILD_DATE=${BUILD_DATE}" >> $GITHUB_OUTPUT
+        echo "FULL_SHA=${FULL_SHA}" >> $GITHUB_OUTPUT
+        echo "COMMIT_DATE=${COMMIT_DATE}" >> $GITHUB_OUTPUT
+        echo "REF_NAME=${REF_NAME}" >> $GITHUB_OUTPUT
+        echo "BRANCH_NAME=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+        echo "TIMESTAMP=${TIMESTAMP}" >> $GITHUB_OUTPUT
+        echo "SHORT_SHA=${SHORT_SHA}" >> $GITHUB_OUTPUT
+        echo "SERVICE_NAME=${SERVICE_NAME}" >> $GITHUB_OUTPUT
