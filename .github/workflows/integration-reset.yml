@@ -17,8 +17,7 @@ name: integration-reset (reusable)
 #         actions: write         # solo se si usa deploy_workflow
 #       uses: mycomp-it/ci-cd-reusable-actions/.github/workflows/integration-reset.yml@main
 #       with:
-#         runner: self-hosted
-#         deploy_workflow: stg-build-deploy.yml
+#         deploy_workflow: stg-build-deploy.yml   # gira sui runner self-hosted dell'org
 #       secrets:
 #         token: ${{ secrets.GITHUB_TOKEN }}
 #         slack_webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
@@ -67,9 +66,9 @@ on:
         default: false
         type: boolean
       runner:
-        description: Label del runner (ubuntu-latest, self-hosted, ...).
+        description: Label del runner. Override a ubuntu-latest per i repo senza runner propri.
         required: false
-        default: ubuntu-latest
+        default: self-hosted
         type: string
       git_user_name:
         description: git user.name per i commit di merge.
