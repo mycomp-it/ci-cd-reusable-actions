@@ -1,0 +1,262 @@
+name: integration-reset (reusable)
+
+# Reusable: riallinea il branch `integration` a `main` e ri-applica le feature
+# ancora in-flight, cioè quelle con una PR aperta verso main non ancora mergiata.
+#
+# Il match è per chiave ticket (es. MGC-1234), stabile a rebase e squash: si
+# ri-applicano i branch delle PR aperte il cui ticket compare nei commit presenti
+# su integration e non su main; le feature già entrate in main (PR chiusa) vengono
+# droppate. I conflitti in ri-applicazione sono saltati e segnalati.
+#
+# Cross-repo usage:
+#   jobs:
+#     reset:
+#       permissions:
+#         contents: write        # push forzato su integration
+#         pull-requests: read    # lettura delle PR aperte  <-- indispensabile
+#         actions: write         # solo se si usa deploy_workflow
+#       uses: mycomp-it/ci-cd-reusable-actions/.github/workflows/integration-reset.yml@main
+#       with:
+#         deploy_workflow: stg-build-deploy.yml   # gira sui runner self-hosted dell'org
+#       secrets:
+#         token: ${{ secrets.GITHUB_TOKEN }}
+#         slack_webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+#
+# ATTENZIONE ai permessi: in un reusable workflow il GITHUB_TOKEN eredita i permessi
+# del CALLER e il chiamato può solo restringerli. Se il caller dichiara un blocco
+# `permissions:` senza `pull-requests: read`, la lettura delle PR risponde 403: qui il
+# job si ferma PRIMA di toccare integration, invece di resettarlo perdendo le feature.
+#
+# Il push con il GITHUB_TOKEN di default non ri-triggera altri workflow: per questo il
+# deploy si lancia con un workflow_dispatch esplicito (`deploy_workflow`). Se serve che
+# il push stesso inneschi CI, passare un PAT / GitHub App token come secrets.token.
+on:
+  workflow_call:
+    inputs:
+      integration_branch:
+        description: Branch di integrazione da riallineare.
+        required: false
+        default: integration
+        type: string
+      base_branch:
+        description: Branch di riferimento a cui riallineare (la linea rilasciata).
+        required: false
+        default: main
+        type: string
+      ticket_prefix:
+        description: Prefisso della chiave ticket usata per il match (es. MGC -> MGC-1234).
+        required: false
+        default: MGC
+        type: string
+      jira_base_url:
+        description: Base URL per i link ticket nel report Slack.
+        required: false
+        default: 'https://myguestcare.atlassian.net/browse'
+        type: string
+      deploy_workflow:
+        description: >-
+          File del workflow di deploy da lanciare (workflow_dispatch) sul branch di
+          integrazione dopo il reset, es. stg-build-deploy.yml. Vuoto = nessun deploy.
+        required: false
+        default: ''
+        type: string
+      dry_run:
+        description: Esegue tutto senza pushare, senza deploy e senza notifica Slack.
+        required: false
+        default: false
+        type: boolean
+      runner:
+        description: Label del runner. Override a ubuntu-latest per i repo senza runner propri.
+        required: false
+        default: self-hosted
+        type: string
+      git_user_name:
+        description: git user.name per i commit di merge.
+        required: false
+        default: github-actions[bot]
+        type: string
+      git_user_email:
+        description: git user.email per i commit di merge.
+        required: false
+        default: 41898282+github-actions[bot]@users.noreply.github.com
+        type: string
+    secrets:
+      token:
+        description: Token con contents:write (push) e pull-requests:read (lettura PR).
+        required: true
+      slack_webhook_url:
+        description: Webhook Slack per il report. Se assente la notifica viene saltata.
+        required: false
+
+jobs:
+  reset:
+    name: Reset ${{ inputs.integration_branch }} a ${{ inputs.base_branch }}
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: write
+      pull-requests: read
+      actions: write
+    steps:
+      - name: Checkout (storia completa)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.token }}
+          persist-credentials: true
+
+      - name: Reset + reapply feature in-flight
+        # I valori non fidati (nomi di branch, titoli PR) passano da env e finiscono
+        # solo come argomenti quotati: mai interpolati nello shell.
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+          SLACK_WEBHOOK_URL: ${{ secrets.slack_webhook_url }}
+          INTEGRATION_BRANCH: ${{ inputs.integration_branch }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+          TICKET_PREFIX: ${{ inputs.ticket_prefix }}
+          JIRA_BASE: ${{ inputs.jira_base_url }}
+          DEPLOY_WORKFLOW: ${{ inputs.deploy_workflow }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          GIT_USER_NAME: ${{ inputs.git_user_name }}
+          GIT_USER_EMAIL: ${{ inputs.git_user_email }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          git config user.name  "$GIT_USER_NAME"
+          git config user.email "$GIT_USER_EMAIL"
+
+          # Tutti i branch remoti (il checkout imposta un refspec ristretto).
+          git fetch --prune origin '+refs/heads/*:refs/remotes/origin/*'
+
+          for b in "$BASE_BRANCH" "$INTEGRATION_BRANCH"; do
+            if ! git show-ref --verify --quiet "refs/remotes/origin/${b}"; then
+              echo "::error::Branch '${b}' inesistente su origin."
+              exit 1
+            fi
+          done
+
+          TICKET_RE="${TICKET_PREFIX}-[0-9]+"
+
+          api() {
+            curl -sf -H "Authorization: Bearer ${GH_TOKEN}" \
+                 -H "Accept: application/vnd.github+json" "$@"
+          }
+
+          slack() {
+            [ -n "${SLACK_WEBHOOK_URL:-}" ] || return 0
+            [ "$DRY_RUN" = "true" ] && { echo "[dry-run] Slack: $1"; return 0; }
+            curl -sf -X POST -H 'Content-type: application/json' \
+              --data "$(jq -n --arg t "$1" '{text: $t}')" "$SLACK_WEBHOOK_URL" >/dev/null || true
+          }
+
+          # 1) Ticket presenti su integration oltre la base (in-flight candidati).
+          #    Si guarda anche il body dei commit, non solo il subject.
+          mapfile -t INT_TICKETS < <(git log "origin/${BASE_BRANCH}..origin/${INTEGRATION_BRANCH}" --format='%s%n%b' \
+            | grep -oE "$TICKET_RE" | sort -u)
+          echo "Ticket su ${INTEGRATION_BRANCH} oltre ${BASE_BRANCH}: ${#INT_TICKETS[@]}"
+
+          is_int_ticket() {
+            local k=$1 t
+            for t in "${INT_TICKETS[@]:-}"; do [ "$k" = "$t" ] && return 0; done
+            return 1
+          }
+
+          # 2) PR aperte verso la base -> tieni quelle il cui ticket è in-flight.
+          #    La lettura sta fuori dalla process substitution del ciclo: lì un errore di
+          #    curl non propaga e una lista vuota sarebbe indistinguibile da "nessuna PR
+          #    aperta", con il reset che prosegue buttando via le feature in-flight.
+          if ! PRS_JSON=$(api "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/pulls?base=${BASE_BRANCH}&state=open&per_page=100") \
+             || ! printf '%s' "$PRS_JSON" | jq -e 'type == "array"' >/dev/null; then
+            slack "🛑 *${INTEGRATION_BRANCH} NON resettato*: lettura delle PR aperte non riuscita (<${REPO_URL}/actions/runs/${GITHUB_RUN_ID}|run>). Verificare che il caller conceda \`pull-requests: read\`."
+            echo "::error::Lettura delle PR aperte non riuscita: ${INTEGRATION_BRANCH} non viene toccato. Serve 'pull-requests: read' sul job chiamante."
+            exit 1
+          fi
+          PR_COUNT=$(printf '%s' "$PRS_JSON" | jq 'length')
+          echo "PR aperte verso ${BASE_BRANCH}: ${PR_COUNT}"
+          if [ "$PR_COUNT" -ge 100 ]; then
+            echo "::warning::100 PR aperte lette: possibile troncamento della prima pagina."
+          fi
+
+          reapply=()   # "num branch ticket"
+          while IFS=$'\t' read -r num branch title; do
+            [ -z "${num:-}" ] && continue
+            ticket=$(printf '%s %s' "$branch" "$title" | grep -oE "$TICKET_RE" | head -1 || true)
+            [ -z "$ticket" ] && continue
+            match=""
+            while read -r k; do
+              [ -z "$k" ] && continue
+              if is_int_ticket "$k"; then match=1; break; fi
+            done < <(printf '%s %s' "$branch" "$title" | grep -oE "$TICKET_RE" | sort -u)
+            [ -n "$match" ] && reapply+=("$num $branch $ticket")
+          done < <(printf '%s' "$PRS_JSON" | jq -r '.[] | "\(.number)\t\(.head.ref)\t\(.title)"')
+
+          if [ "${#reapply[@]}" -gt 0 ]; then
+            mapfile -t reapply < <(printf '%s\n' "${reapply[@]}" | sort -n)
+          fi
+          echo "Feature in-flight da ri-applicare: ${#reapply[@]}"
+
+          # 3) Reset alla base.
+          git checkout -B "$INTEGRATION_BRANCH" "origin/${BASE_BRANCH}"
+
+          # 4) Ri-applica i branch (ordine PR#); conflitti -> skip + registra.
+          applied=()    # "num ticket"
+          conflicts=()  # "num branch"
+          if [ "${#reapply[@]}" -gt 0 ]; then
+            for entry in "${reapply[@]}"; do
+              read -r num branch ticket <<< "$entry"
+              if ! git show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
+                conflicts+=("$num $branch")
+                echo "branch origin/${branch} assente -> #${num} saltata"
+                continue
+              fi
+              if git merge --no-ff -m "reapply ${branch} [PR #${num}]" "origin/${branch}"; then
+                applied+=("$num $ticket")
+                echo "ri-applicato #$num ($ticket)"
+              else
+                git merge --abort || true
+                conflicts+=("$num $branch")
+                echo "CONFLITTO #$num ($branch) -> saltato"
+              fi
+            done
+          fi
+
+          # 5) Push forzato.
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "[dry-run] niente push: ${INTEGRATION_BRANCH} sarebbe = ${BASE_BRANCH} + ${#applied[@]} feature (conflitti: ${#conflicts[@]})."
+          else
+            git push --force origin "$INTEGRATION_BRANCH"
+            echo "${INTEGRATION_BRANCH} = ${BASE_BRANCH} + ${#applied[@]} feature in-flight (conflitti: ${#conflicts[@]})."
+          fi
+
+          # 6) Deploy sul branch di integrazione (workflow_dispatch esplicito).
+          if [ -n "$DEPLOY_WORKFLOW" ]; then
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "[dry-run] deploy ${DEPLOY_WORKFLOW} non lanciato."
+            else
+              api -X POST "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/${DEPLOY_WORKFLOW}/dispatches" \
+                -d "$(jq -n --arg r "$INTEGRATION_BRANCH" '{ref: $r}')" \
+                && echo "Deploy ${DEPLOY_WORKFLOW} avviato." || echo "::warning::dispatch di ${DEPLOY_WORKFLOW} non riuscito."
+            fi
+          fi
+
+          # 7) Report su Slack.
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "slack_webhook_url non configurato: salto notifica."
+            exit 0
+          fi
+          msg="♻️ *${INTEGRATION_BRANCH} resettato a ${BASE_BRANCH}* — ${#applied[@]} feature in-flight ri-applicate"
+          if [ "${#applied[@]}" -gt 0 ]; then
+            for a in "${applied[@]}"; do
+              read -r num ticket <<< "$a"
+              msg="${msg}"$'\n'"• <${JIRA_BASE}/${ticket}|${ticket}> — <${REPO_URL}/pull/${num}|#${num}>"
+            done
+          fi
+          if [ "${#conflicts[@]}" -gt 0 ]; then
+            msg="${msg}"$'\n'"⚠️ *da re-integrare a mano (conflitto):*"
+            for c in "${conflicts[@]}"; do
+              read -r num branch <<< "$c"
+              msg="${msg}"$'\n'"• <${REPO_URL}/pull/${num}|#${num}> (${branch})"
+            done
+          fi
+          slack "$msg"
+          echo "Report Slack inviato."
