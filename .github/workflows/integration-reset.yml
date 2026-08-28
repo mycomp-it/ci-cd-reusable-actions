@@ -161,18 +161,22 @@ jobs:
             return 1
           }
 
-          # 2) PR aperte verso la base -> tieni quelle il cui ticket è in-flight.
+          # 2) PR aperte -> tieni quelle il cui ticket è in-flight.
+          #    Non si filtra per base: le PR "stacked" (base = un altro branch feature,
+          #    non la linea rilasciata) devono comunque essere ri-applicate, altrimenti
+          #    la loro feature sparisce da integration ad ogni reset. Il gate vero è il
+          #    match del ticket con INT_TICKETS (is_int_ticket), non la base della PR.
           #    La lettura sta fuori dalla process substitution del ciclo: lì un errore di
           #    curl non propaga e una lista vuota sarebbe indistinguibile da "nessuna PR
           #    aperta", con il reset che prosegue buttando via le feature in-flight.
-          if ! PRS_JSON=$(api "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/pulls?base=${BASE_BRANCH}&state=open&per_page=100") \
+          if ! PRS_JSON=$(api "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/pulls?state=open&per_page=100") \
              || ! printf '%s' "$PRS_JSON" | jq -e 'type == "array"' >/dev/null; then
             slack "🛑 *${INTEGRATION_BRANCH} NON resettato*: lettura delle PR aperte non riuscita (<${REPO_URL}/actions/runs/${GITHUB_RUN_ID}|run>). Verificare che il caller conceda \`pull-requests: read\`."
             echo "::error::Lettura delle PR aperte non riuscita: ${INTEGRATION_BRANCH} non viene toccato. Serve 'pull-requests: read' sul job chiamante."
             exit 1
           fi
           PR_COUNT=$(printf '%s' "$PRS_JSON" | jq 'length')
-          echo "PR aperte verso ${BASE_BRANCH}: ${PR_COUNT}"
+          echo "PR aperte (tutte le base): ${PR_COUNT}"
           if [ "$PR_COUNT" -ge 100 ]; then
             echo "::warning::100 PR aperte lette: possibile troncamento della prima pagina."
           fi
