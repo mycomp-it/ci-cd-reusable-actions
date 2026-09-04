@@ -194,22 +194,28 @@ jobs:
             [ -n "$match" ] && reapply+=("$num $branch $ticket")
           done < <(printf '%s' "$PRS_JSON" | jq -r '.[] | "\(.number)\t\(.head.ref)\t\(.title)"')
 
+          # Ordine DECRESCENTE (PR piu' recente prima): per gli stack il branch del tip
+          # contiene gia' i commit dei branch base sottostanti, quindi mergiandolo per
+          # primo entra tutta la catena in un colpo; le eventuali PR base piu' vecchie,
+          # se anch'esse candidate, si mergiano dopo come no-op (Already up to date).
+          # Il contrario (dal piu' vecchio) applicherebbe prima una base parziale e poi
+          # rischierebbe il conflitto sul tip.
           if [ "${#reapply[@]}" -gt 0 ]; then
-            mapfile -t reapply < <(printf '%s\n' "${reapply[@]}" | sort -n)
+            mapfile -t reapply < <(printf '%s\n' "${reapply[@]}" | sort -rn)
           fi
           echo "Feature in-flight da ri-applicare: ${#reapply[@]}"
 
           # 3) Reset alla base.
           git checkout -B "$INTEGRATION_BRANCH" "origin/${BASE_BRANCH}"
 
-          # 4) Ri-applica i branch (ordine PR#); conflitti -> skip + registra.
+          # 4) Ri-applica i branch (tip degli stack prima); conflitti -> skip + registra.
           applied=()    # "num ticket"
-          conflicts=()  # "num branch"
+          conflicts=()  # "num branch ticket"
           if [ "${#reapply[@]}" -gt 0 ]; then
             for entry in "${reapply[@]}"; do
               read -r num branch ticket <<< "$entry"
               if ! git show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
-                conflicts+=("$num $branch")
+                conflicts+=("$num $branch $ticket")
                 echo "branch origin/${branch} assente -> #${num} saltata"
                 continue
               fi
@@ -218,7 +224,7 @@ jobs:
                 echo "ri-applicato #$num ($ticket)"
               else
                 git merge --abort || true
-                conflicts+=("$num $branch")
+                conflicts+=("$num $branch $ticket")
                 echo "CONFLITTO #$num ($branch) -> saltato"
               fi
             done
@@ -256,10 +262,14 @@ jobs:
             done
           fi
           if [ "${#conflicts[@]}" -gt 0 ]; then
-            msg="${msg}"$'\n'"⚠️ *da re-integrare a mano (conflitto):*"
+            msg="${msg}"$'\n'"⚠️ *${#conflicts[@]} PR da re-integrare a mano (conflitto):*"
             for c in "${conflicts[@]}"; do
-              read -r num branch <<< "$c"
-              msg="${msg}"$'\n'"• <${REPO_URL}/pull/${num}|#${num}> (${branch})"
+              read -r num branch ticket <<< "$c"
+              if [ -n "${ticket:-}" ]; then
+                msg="${msg}"$'\n'"• <${JIRA_BASE}/${ticket}|${ticket}> — <${REPO_URL}/pull/${num}|#${num}> (${branch})"
+              else
+                msg="${msg}"$'\n'"• <${REPO_URL}/pull/${num}|#${num}> (${branch})"
+              fi
             done
           fi
           slack "$msg"
