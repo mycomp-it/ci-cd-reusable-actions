@@ -210,12 +210,12 @@ jobs:
 
           # 4) Ri-applica i branch (tip degli stack prima); conflitti -> skip + registra.
           applied=()    # "num ticket"
-          conflicts=()  # "num branch"
+          conflicts=()  # "num branch ticket"
           if [ "${#reapply[@]}" -gt 0 ]; then
             for entry in "${reapply[@]}"; do
               read -r num branch ticket <<< "$entry"
               if ! git show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
-                conflicts+=("$num $branch")
+                conflicts+=("$num $branch $ticket")
                 echo "branch origin/${branch} assente -> #${num} saltata"
                 continue
               fi
@@ -224,7 +224,7 @@ jobs:
                 echo "ri-applicato #$num ($ticket)"
               else
                 git merge --abort || true
-                conflicts+=("$num $branch")
+                conflicts+=("$num $branch $ticket")
                 echo "CONFLITTO #$num ($branch) -> saltato"
               fi
             done
@@ -262,10 +262,14 @@ jobs:
             done
           fi
           if [ "${#conflicts[@]}" -gt 0 ]; then
-            msg="${msg}"$'\n'"⚠️ *da re-integrare a mano (conflitto):*"
+            msg="${msg}"$'\n'"⚠️ *${#conflicts[@]} PR da re-integrare a mano (conflitto):*"
             for c in "${conflicts[@]}"; do
-              read -r num branch <<< "$c"
-              msg="${msg}"$'\n'"• <${REPO_URL}/pull/${num}|#${num}> (${branch})"
+              read -r num branch ticket <<< "$c"
+              if [ -n "${ticket:-}" ]; then
+                msg="${msg}"$'\n'"• <${JIRA_BASE}/${ticket}|${ticket}> — <${REPO_URL}/pull/${num}|#${num}> (${branch})"
+              else
+                msg="${msg}"$'\n'"• <${REPO_URL}/pull/${num}|#${num}> (${branch})"
+              fi
             done
           fi
           slack "$msg"
