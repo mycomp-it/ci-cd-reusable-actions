@@ -194,15 +194,21 @@ jobs:
             [ -n "$match" ] && reapply+=("$num $branch $ticket")
           done < <(printf '%s' "$PRS_JSON" | jq -r '.[] | "\(.number)\t\(.head.ref)\t\(.title)"')
 
+          # Ordine DECRESCENTE (PR piu' recente prima): per gli stack il branch del tip
+          # contiene gia' i commit dei branch base sottostanti, quindi mergiandolo per
+          # primo entra tutta la catena in un colpo; le eventuali PR base piu' vecchie,
+          # se anch'esse candidate, si mergiano dopo come no-op (Already up to date).
+          # Il contrario (dal piu' vecchio) applicherebbe prima una base parziale e poi
+          # rischierebbe il conflitto sul tip.
           if [ "${#reapply[@]}" -gt 0 ]; then
-            mapfile -t reapply < <(printf '%s\n' "${reapply[@]}" | sort -n)
+            mapfile -t reapply < <(printf '%s\n' "${reapply[@]}" | sort -rn)
           fi
           echo "Feature in-flight da ri-applicare: ${#reapply[@]}"
 
           # 3) Reset alla base.
           git checkout -B "$INTEGRATION_BRANCH" "origin/${BASE_BRANCH}"
 
-          # 4) Ri-applica i branch (ordine PR#); conflitti -> skip + registra.
+          # 4) Ri-applica i branch (tip degli stack prima); conflitti -> skip + registra.
           applied=()    # "num ticket"
           conflicts=()  # "num branch"
           if [ "${#reapply[@]}" -gt 0 ]; then
