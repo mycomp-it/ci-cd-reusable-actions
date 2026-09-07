@@ -169,17 +169,30 @@ jobs:
           #    La lettura sta fuori dalla process substitution del ciclo: lì un errore di
           #    curl non propaga e una lista vuota sarebbe indistinguibile da "nessuna PR
           #    aperta", con il reset che prosegue buttando via le feature in-flight.
-          if ! PRS_JSON=$(api "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/pulls?state=open&per_page=100") \
-             || ! printf '%s' "$PRS_JSON" | jq -e 'type == "array"' >/dev/null; then
-            slack "🛑 *${INTEGRATION_BRANCH} NON resettato*: lettura delle PR aperte non riuscita (<${REPO_URL}/actions/runs/${GITHUB_RUN_ID}|run>). Verificare che il caller conceda \`pull-requests: read\`."
-            echo "::error::Lettura delle PR aperte non riuscita: ${INTEGRATION_BRANCH} non viene toccato. Serve 'pull-requests: read' sul job chiamante."
-            exit 1
-          fi
+          #    Si pagina fino all'ultima pagina: fermarsi alla prima perderebbe le PR
+          #    oltre la centesima senza che il reset se ne accorga, ri-applicando solo
+          #    una parte delle feature in volo. Il cap sulle pagine evita che una
+          #    risposta anomala dell'API tenga il job in ciclo per sempre.
+          PRS_JSON='[]'
+          page=1
+          while :; do
+            if ! PAGE_JSON=$(api "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/pulls?state=open&per_page=100&page=${page}") \
+               || ! printf '%s' "$PAGE_JSON" | jq -e 'type == "array"' >/dev/null; then
+              slack "🛑 *${INTEGRATION_BRANCH} NON resettato*: lettura delle PR aperte non riuscita (<${REPO_URL}/actions/runs/${GITHUB_RUN_ID}|run>). Verificare che il caller conceda \`pull-requests: read\`."
+              echo "::error::Lettura delle PR aperte non riuscita: ${INTEGRATION_BRANCH} non viene toccato. Serve 'pull-requests: read' sul job chiamante."
+              exit 1
+            fi
+            PAGE_COUNT=$(printf '%s' "$PAGE_JSON" | jq 'length')
+            PRS_JSON=$(printf '%s\n%s' "$PRS_JSON" "$PAGE_JSON" | jq -s 'add')
+            [ "$PAGE_COUNT" -lt 100 ] && break
+            if [ "$page" -ge 20 ]; then
+              echo "::warning::20 pagine di PR aperte lette: lettura interrotta per sicurezza."
+              break
+            fi
+            page=$((page + 1))
+          done
           PR_COUNT=$(printf '%s' "$PRS_JSON" | jq 'length')
           echo "PR aperte (tutte le base): ${PR_COUNT}"
-          if [ "$PR_COUNT" -ge 100 ]; then
-            echo "::warning::100 PR aperte lette: possibile troncamento della prima pagina."
-          fi
 
           reapply=()   # "num branch ticket"
           while IFS=$'\t' read -r num branch title; do
@@ -194,22 +207,28 @@ jobs:
             [ -n "$match" ] && reapply+=("$num $branch $ticket")
           done < <(printf '%s' "$PRS_JSON" | jq -r '.[] | "\(.number)\t\(.head.ref)\t\(.title)"')
 
+          # Ordine DECRESCENTE (PR piu' recente prima): per gli stack il branch del tip
+          # contiene gia' i commit dei branch base sottostanti, quindi mergiandolo per
+          # primo entra tutta la catena in un colpo; le eventuali PR base piu' vecchie,
+          # se anch'esse candidate, si mergiano dopo come no-op (Already up to date).
+          # Il contrario (dal piu' vecchio) applicherebbe prima una base parziale e poi
+          # rischierebbe il conflitto sul tip.
           if [ "${#reapply[@]}" -gt 0 ]; then
-            mapfile -t reapply < <(printf '%s\n' "${reapply[@]}" | sort -n)
+            mapfile -t reapply < <(printf '%s\n' "${reapply[@]}" | sort -rn)
           fi
           echo "Feature in-flight da ri-applicare: ${#reapply[@]}"
 
           # 3) Reset alla base.
           git checkout -B "$INTEGRATION_BRANCH" "origin/${BASE_BRANCH}"
 
-          # 4) Ri-applica i branch (ordine PR#); conflitti -> skip + registra.
+          # 4) Ri-applica i branch (tip degli stack prima); conflitti -> skip + registra.
           applied=()    # "num ticket"
-          conflicts=()  # "num branch"
+          conflicts=()  # "num branch ticket"
           if [ "${#reapply[@]}" -gt 0 ]; then
             for entry in "${reapply[@]}"; do
               read -r num branch ticket <<< "$entry"
               if ! git show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
-                conflicts+=("$num $branch")
+                conflicts+=("$num $branch $ticket")
                 echo "branch origin/${branch} assente -> #${num} saltata"
                 continue
               fi
@@ -218,7 +237,7 @@ jobs:
                 echo "ri-applicato #$num ($ticket)"
               else
                 git merge --abort || true
-                conflicts+=("$num $branch")
+                conflicts+=("$num $branch $ticket")
                 echo "CONFLITTO #$num ($branch) -> saltato"
               fi
             done
@@ -256,10 +275,14 @@ jobs:
             done
           fi
           if [ "${#conflicts[@]}" -gt 0 ]; then
-            msg="${msg}"$'\n'"⚠️ *da re-integrare a mano (conflitto):*"
+            msg="${msg}"$'\n'"⚠️ *${#conflicts[@]} PR da re-integrare a mano (conflitto):*"
             for c in "${conflicts[@]}"; do
-              read -r num branch <<< "$c"
-              msg="${msg}"$'\n'"• <${REPO_URL}/pull/${num}|#${num}> (${branch})"
+              read -r num branch ticket <<< "$c"
+              if [ -n "${ticket:-}" ]; then
+                msg="${msg}"$'\n'"• <${JIRA_BASE}/${ticket}|${ticket}> — <${REPO_URL}/pull/${num}|#${num}> (${branch})"
+              else
+                msg="${msg}"$'\n'"• <${REPO_URL}/pull/${num}|#${num}> (${branch})"
+              fi
             done
           fi
           slack "$msg"
