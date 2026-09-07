@@ -169,17 +169,30 @@ jobs:
           #    La lettura sta fuori dalla process substitution del ciclo: lì un errore di
           #    curl non propaga e una lista vuota sarebbe indistinguibile da "nessuna PR
           #    aperta", con il reset che prosegue buttando via le feature in-flight.
-          if ! PRS_JSON=$(api "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/pulls?state=open&per_page=100") \
-             || ! printf '%s' "$PRS_JSON" | jq -e 'type == "array"' >/dev/null; then
-            slack "🛑 *${INTEGRATION_BRANCH} NON resettato*: lettura delle PR aperte non riuscita (<${REPO_URL}/actions/runs/${GITHUB_RUN_ID}|run>). Verificare che il caller conceda \`pull-requests: read\`."
-            echo "::error::Lettura delle PR aperte non riuscita: ${INTEGRATION_BRANCH} non viene toccato. Serve 'pull-requests: read' sul job chiamante."
-            exit 1
-          fi
+          #    Si pagina fino all'ultima pagina: fermarsi alla prima perderebbe le PR
+          #    oltre la centesima senza che il reset se ne accorga, ri-applicando solo
+          #    una parte delle feature in volo. Il cap sulle pagine evita che una
+          #    risposta anomala dell'API tenga il job in ciclo per sempre.
+          PRS_JSON='[]'
+          page=1
+          while :; do
+            if ! PAGE_JSON=$(api "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/pulls?state=open&per_page=100&page=${page}") \
+               || ! printf '%s' "$PAGE_JSON" | jq -e 'type == "array"' >/dev/null; then
+              slack "🛑 *${INTEGRATION_BRANCH} NON resettato*: lettura delle PR aperte non riuscita (<${REPO_URL}/actions/runs/${GITHUB_RUN_ID}|run>). Verificare che il caller conceda \`pull-requests: read\`."
+              echo "::error::Lettura delle PR aperte non riuscita: ${INTEGRATION_BRANCH} non viene toccato. Serve 'pull-requests: read' sul job chiamante."
+              exit 1
+            fi
+            PAGE_COUNT=$(printf '%s' "$PAGE_JSON" | jq 'length')
+            PRS_JSON=$(printf '%s\n%s' "$PRS_JSON" "$PAGE_JSON" | jq -s 'add')
+            [ "$PAGE_COUNT" -lt 100 ] && break
+            if [ "$page" -ge 20 ]; then
+              echo "::warning::20 pagine di PR aperte lette: lettura interrotta per sicurezza."
+              break
+            fi
+            page=$((page + 1))
+          done
           PR_COUNT=$(printf '%s' "$PRS_JSON" | jq 'length')
           echo "PR aperte (tutte le base): ${PR_COUNT}"
-          if [ "$PR_COUNT" -ge 100 ]; then
-            echo "::warning::100 PR aperte lette: possibile troncamento della prima pagina."
-          fi
 
           reapply=()   # "num branch ticket"
           while IFS=$'\t' read -r num branch title; do
