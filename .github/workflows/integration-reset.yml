@@ -6,7 +6,9 @@ name: integration-reset (reusable)
 # Il match è per chiave ticket (es. MGC-1234), stabile a rebase e squash: si
 # ri-applicano i branch delle PR aperte il cui ticket compare nei commit presenti
 # su integration e non su main; le feature già entrate in main (PR chiusa) vengono
-# droppate. I conflitti in ri-applicazione sono saltati e segnalati.
+# droppate. I conflitti in ri-applicazione sono saltati e segnalati, tranne quelli che
+# toccano solo i file dichiarati in `append_only_paths`: lì il conflitto è una collisione
+# di append e viene risolto tenendo la base e ri-appendendo il blocco del branch.
 #
 # Cross-repo usage:
 #   jobs:
@@ -18,6 +20,7 @@ name: integration-reset (reusable)
 #       uses: mycomp-it/ci-cd-reusable-actions/.github/workflows/integration-reset.yml@main
 #       with:
 #         deploy_workflow: stg-build-deploy.yml   # gira sui runner self-hosted dell'org
+#         append_only_paths: path/to/updatemodel.sql   # conflitti di append risolti da soli
 #       secrets:
 #         token: ${{ secrets.GITHUB_TOKEN }}
 #         slack_webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
@@ -47,6 +50,14 @@ on:
         description: Prefisso della chiave ticket usata per il match (es. MGC -> MGC-1234).
         required: false
         default: MGC
+        type: string
+      append_only_paths:
+        description: >-
+          Path (separati da spazi) di file append-only, es. il file delle migrazioni SQL.
+          Un conflitto di merge che tocca SOLO questi file viene risolto automaticamente
+          tenendo la versione della base e ri-appendendo il blocco del branch. Vuoto = nessuno.
+        required: false
+        default: ''
         type: string
       jira_base_url:
         description: Base URL per i link ticket nel report Slack.
@@ -113,6 +124,7 @@ jobs:
           INTEGRATION_BRANCH: ${{ inputs.integration_branch }}
           BASE_BRANCH: ${{ inputs.base_branch }}
           TICKET_PREFIX: ${{ inputs.ticket_prefix }}
+          APPEND_ONLY_PATHS: ${{ inputs.append_only_paths }}
           JIRA_BASE: ${{ inputs.jira_base_url }}
           DEPLOY_WORKFLOW: ${{ inputs.deploy_workflow }}
           DRY_RUN: ${{ inputs.dry_run }}
@@ -147,6 +159,53 @@ jobs:
             [ "$DRY_RUN" = "true" ] && { echo "[dry-run] Slack: $1"; return 0; }
             curl -sf -X POST -H 'Content-type: application/json' \
               --data "$(jq -n --arg t "$1" '{text: $t}')" "$SLACK_WEBHOOK_URL" >/dev/null || true
+          }
+
+          is_append_only() {
+            local f=$1 p
+            for p in ${APPEND_ONLY_PATHS:-}; do [ "$f" = "$p" ] && return 0; done
+            return 1
+          }
+
+          # Su un file append-only (le migrazioni SQL) il conflitto non e' una divergenza
+          # semantica ma una collisione di append: ogni branch aperto prima del commit che
+          # svuota il file a rilascio avvenuto ne ha ancora il contenuto vecchio, mentre la
+          # base l'ha troncato. Senza questa risoluzione ogni PR con migrazione conflitta a
+          # ogni release, per sempre, e va re-integrata a mano.
+          # Risoluzione: contenuto della base + le sole righe che il branch aggiunge rispetto
+          # alla propria merge-base. Le migrazioni gia' rilasciate stanno nella merge-base,
+          # quindi non vengono resuscitate.
+          # Vale solo se TUTTI i file in conflitto sono dichiarati append-only: basta un file
+          # di codice fra i conflitti e si torna allo skip, che e' il comportamento sicuro.
+          resolve_append_only() {
+            local branch=$1 f mb block base_last
+            [ -n "${APPEND_ONLY_PATHS:-}" ] || return 1
+            mb=$(git merge-base HEAD "origin/${branch}") || return 1
+            for f in $(git diff --name-only --diff-filter=U); do
+              is_append_only "$f" || return 1
+            done
+            for f in $(git diff --name-only --diff-filter=U); do
+              block=$(mktemp)
+              # `set -e` non e' attivo qui dentro (la funzione gira in un contesto di
+              # condizione): senza il controllo esplicito, un blocco vuoto passerebbe come
+              # risoluzione riuscita e la migrazione del branch sparirebbe in silenzio.
+              git diff "$mb" "origin/${branch}" -- "$f" \
+                | grep '^+' | grep -v '^+++' | sed 's/^+//; s/\r$//' > "$block" || true
+              if [ ! -s "$block" ]; then rm -f "$block"; return 1; fi
+              # Un file senza newline finale fa ricomparire la sua ultima riga fra le aggiunte.
+              base_last=$(git show "${mb}:${f}" 2>/dev/null | tail -1 | sed 's/\r$//' || true)
+              if [ -n "$base_last" ] && [ "$(head -1 "$block")" = "$base_last" ]; then
+                sed -i 1d "$block"
+              fi
+              git show "HEAD:${f}" > "$f" 2>/dev/null || : > "$f"
+              # Il file sulla base puo' essere CRLF mentre il branch scrive il blocco in LF:
+              # senza allineare i fine riga resta un file misto.
+              if tail -1 "$f" | grep -q $'\r$'; then sed -i 's/$/\r/' "$block"; fi
+              cat "$block" >> "$f"
+              rm -f "$block"
+              git add "$f"
+            done
+            return 0
           }
 
           # 1) Ticket presenti su integration oltre la base (in-flight candidati).
@@ -223,6 +282,7 @@ jobs:
 
           # 4) Ri-applica i branch (tip degli stack prima); conflitti -> skip + registra.
           applied=()    # "num ticket"
+          resolved=()   # "num ticket" - sottoinsieme di applied, risolto su file append-only
           conflicts=()  # "num branch ticket"
           if [ "${#reapply[@]}" -gt 0 ]; then
             for entry in "${reapply[@]}"; do
@@ -235,6 +295,11 @@ jobs:
               if git merge --no-ff -m "reapply ${branch} [PR #${num}]" "origin/${branch}"; then
                 applied+=("$num $ticket")
                 echo "ri-applicato #$num ($ticket)"
+              elif resolve_append_only "$branch" \
+                   && git commit --no-edit -m "reapply ${branch} [PR #${num}]"; then
+                applied+=("$num $ticket")
+                resolved+=("$num $ticket")
+                echo "ri-applicato #$num ($ticket) risolvendo il conflitto append-only"
               else
                 git merge --abort || true
                 conflicts+=("$num $branch $ticket")
@@ -273,6 +338,9 @@ jobs:
               read -r num ticket <<< "$a"
               msg="${msg}"$'\n'"• <${JIRA_BASE}/${ticket}|${ticket}> — <${REPO_URL}/pull/${num}|#${num}>"
             done
+          fi
+          if [ "${#resolved[@]}" -gt 0 ]; then
+            msg="${msg}"$'\n'"🧩 di cui ${#resolved[@]} risolte in automatico sui file append-only."
           fi
           if [ "${#conflicts[@]}" -gt 0 ]; then
             msg="${msg}"$'\n'"⚠️ *${#conflicts[@]} PR da re-integrare a mano (conflitto):*"
