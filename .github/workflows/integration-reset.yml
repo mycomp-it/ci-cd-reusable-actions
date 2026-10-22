@@ -3,7 +3,7 @@ name: integration-reset (reusable)
 # Reusable: riallinea il branch `integration` a `main` e ri-applica le feature
 # ancora in-flight, cioè quelle con una PR aperta verso main non ancora mergiata.
 #
-# Il match è per chiave ticket (es. MGC-1234), stabile a rebase e squash: si
+# Il match è per chiave ticket (es. MGC-1234, SPAY-50), stabile a rebase e squash: si
 # ri-applicano i branch delle PR aperte il cui ticket compare nei commit presenti
 # su integration e non su main; le feature già entrate in main (PR chiusa) vengono
 # droppate. I conflitti in ri-applicazione sono saltati e segnalati, tranne quelli che
@@ -47,9 +47,12 @@ on:
         default: main
         type: string
       ticket_prefix:
-        description: Prefisso della chiave ticket usata per il match (es. MGC -> MGC-1234).
+        description: >-
+          Prefissi delle chiavi ticket usate per il match, separati da spazi
+          (es. 'MGC SPAY' -> MGC-1234, SPAY-50). Una PR con un ticket di un prefisso
+          non elencato non viene mai ri-applicata.
         required: false
-        default: MGC
+        default: 'MGC SPAY'
         type: string
       append_only_paths:
         description: >-
@@ -63,6 +66,13 @@ on:
         description: Base URL per i link ticket nel report Slack.
         required: false
         default: 'https://myguestcare.atlassian.net/browse'
+        type: string
+      jira_base_urls:
+        description: >-
+          Base URL dei link ticket per i prefissi che stanno su un altro sito Jira,
+          separati da spazi nella forma PREFISSO=URL. Gli altri usano `jira_base_url`.
+        required: false
+        default: 'SPAY=https://smartpricing-it.atlassian.net/browse'
         type: string
       deploy_workflow:
         description: >-
@@ -126,6 +136,7 @@ jobs:
           TICKET_PREFIX: ${{ inputs.ticket_prefix }}
           APPEND_ONLY_PATHS: ${{ inputs.append_only_paths }}
           JIRA_BASE: ${{ inputs.jira_base_url }}
+          JIRA_BASE_URLS: ${{ inputs.jira_base_urls }}
           DEPLOY_WORKFLOW: ${{ inputs.deploy_workflow }}
           DRY_RUN: ${{ inputs.dry_run }}
           GIT_USER_NAME: ${{ inputs.git_user_name }}
@@ -147,11 +158,20 @@ jobs:
             fi
           done
 
-          TICKET_RE="${TICKET_PREFIX}-[0-9]+"
+          # 'MGC SPAY' -> (MGC|SPAY)-[0-9]+
+          TICKET_RE="($(printf '%s\n' $TICKET_PREFIX | paste -sd'|'))-[0-9]+"
 
           api() {
             curl -sf -H "Authorization: Bearer ${GH_TOKEN}" \
                  -H "Accept: application/vnd.github+json" "$@"
+          }
+
+          jira_url() {
+            local ticket=$1 entry
+            for entry in ${JIRA_BASE_URLS:-}; do
+              [ "${ticket%%-*}" = "${entry%%=*}" ] && { echo "${entry#*=}/${ticket}"; return; }
+            done
+            echo "${JIRA_BASE}/${ticket}"
           }
 
           slack() {
@@ -336,7 +356,7 @@ jobs:
           if [ "${#applied[@]}" -gt 0 ]; then
             for a in "${applied[@]}"; do
               read -r num ticket <<< "$a"
-              msg="${msg}"$'\n'"• <${JIRA_BASE}/${ticket}|${ticket}> — <${REPO_URL}/pull/${num}|#${num}>"
+              msg="${msg}"$'\n'"• <$(jira_url "$ticket")|${ticket}> — <${REPO_URL}/pull/${num}|#${num}>"
             done
           fi
           if [ "${#resolved[@]}" -gt 0 ]; then
@@ -347,7 +367,7 @@ jobs:
             for c in "${conflicts[@]}"; do
               read -r num branch ticket <<< "$c"
               if [ -n "${ticket:-}" ]; then
-                msg="${msg}"$'\n'"• <${JIRA_BASE}/${ticket}|${ticket}> — <${REPO_URL}/pull/${num}|#${num}> (${branch})"
+                msg="${msg}"$'\n'"• <$(jira_url "$ticket")|${ticket}> — <${REPO_URL}/pull/${num}|#${num}> (${branch})"
               else
                 msg="${msg}"$'\n'"• <${REPO_URL}/pull/${num}|#${num}> (${branch})"
               fi
