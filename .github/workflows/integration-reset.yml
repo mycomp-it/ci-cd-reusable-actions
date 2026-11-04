@@ -178,7 +178,7 @@ jobs:
             [ -n "${SLACK_WEBHOOK_URL:-}" ] || return 0
             [ "$DRY_RUN" = "true" ] && { echo "[dry-run] Slack: $1"; return 0; }
             curl -sf -X POST -H 'Content-type: application/json' \
-              --data "$(jq -n --arg t "$1" '{text: $t}')" "$SLACK_WEBHOOK_URL" >/dev/null || true
+              --data "$(jq -n --arg t "[${GITHUB_REPOSITORY#*/}] $1" '{text: $t}')" "$SLACK_WEBHOOK_URL" >/dev/null || true
           }
 
           is_append_only() {
@@ -257,7 +257,6 @@ jobs:
           while :; do
             if ! PAGE_JSON=$(api "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/pulls?state=open&per_page=100&page=${page}") \
                || ! printf '%s' "$PAGE_JSON" | jq -e 'type == "array"' >/dev/null; then
-              slack "🛑 *${INTEGRATION_BRANCH} NON resettato*: lettura delle PR aperte non riuscita (<${REPO_URL}/actions/runs/${GITHUB_RUN_ID}|run>). Verificare che il caller conceda \`pull-requests: read\`."
               echo "::error::Lettura delle PR aperte non riuscita: ${INTEGRATION_BRANCH} non viene toccato. Serve 'pull-requests: read' sul job chiamante."
               exit 1
             fi
@@ -375,3 +374,17 @@ jobs:
           fi
           slack "$msg"
           echo "Report Slack inviato."
+
+      # Qualsiasi step fallito (push rifiutato, checkout, lettura PR...) deve essere
+      # visibile su Slack: senza, il reset si ferma in silenzio e integration resta indietro.
+      - name: Notifica errore su Slack
+        if: failure() && !inputs.dry_run
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.slack_webhook_url }}
+          INTEGRATION_BRANCH: ${{ inputs.integration_branch }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -n "${SLACK_WEBHOOK_URL:-}" ] || exit 0
+          msg="[${GITHUB_REPOSITORY#*/}] 🛑 *${INTEGRATION_BRANCH} NON resettato* — il workflow è fallito, controllare il <${RUN_URL}|run> e rilanciarlo."
+          curl -sf -X POST -H 'Content-type: application/json' \
+            --data "$(jq -n --arg t "$msg" '{text: $t}')" "$SLACK_WEBHOOK_URL" >/dev/null || true
